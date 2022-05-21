@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
 
@@ -14,6 +15,34 @@ import (
 )
 
 const dbFilename = "chats.db"
+const logFilename = "all_bot.log"
+
+const helpRequest = "@help"
+
+const jumeroskiUrl = "https://t.me/myfavoritejumoreski"
+const jumeroskiPostBound = 11786
+
+func getJokeRequests() []string {
+	return []string{"@joke", "@anecdote", "@анекдот", "@анек"}
+}
+
+func getAllNotificationRequests() []string {
+	return []string{"@all", "@everyone", "@все", "@каждый"}
+}
+
+func containsAnySubstr(s string, substrs []string) bool {
+	for _, sub := range substrs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+type Chat struct {
+	telegramID int64
+	internalID int64
+}
 
 type ChatsDB struct {
 	db *sql.DB
@@ -76,18 +105,8 @@ func NewUtilsBot(bot *tgbotapi.BotAPI, db *ChatsDB, debug bool) *UtilsBot {
 	}
 }
 
-func (self *UtilsBot) chatIsKnown(tgChatId int64) bool {
-	_, err := self.db.GetInternalChatId(tgChatId)
-	return err == nil
-}
-
-func (self *UtilsBot) notifyAllMembers(tgChatId int64) error {
-	internalChatId, err := self.db.GetInternalChatId(tgChatId)
-	if err != nil {
-		return err
-	}
-
-	members, err := self.db.GetParticipants(internalChatId)
+func (self *UtilsBot) notifyAllMembers(chat Chat) error {
+	members, err := self.db.GetParticipants(chat.internalID)
 	if err != nil {
 		return err
 	}
@@ -107,29 +126,46 @@ func (self *UtilsBot) notifyAllMembers(tgChatId int64) error {
 		notifications += fmt.Sprintf(format, members[i])
 	}
 
-	message := tgbotapi.NewMessage(tgChatId, notifications) // TODO: add beginning of the message
+	message := tgbotapi.NewMessage(chat.telegramID, notifications) // TODO: add beginning of the message
 	self.bot.Send(message)
 
 	return nil
 }
 
+func (self *UtilsBot) postJoke(chat Chat) {
+	jokeId := rand.Int31n(jumeroskiPostBound)
+	text := fmt.Sprintf("%v/%d", jumeroskiUrl, jokeId)
+	msg := tgbotapi.NewMessage(chat.telegramID, text)
+	self.bot.Send(msg)
+}
+
 func (self *UtilsBot) needNotifications(message string) bool {
-	return strings.Contains(message, "@all")
+	return containsAnySubstr(message, getAllNotificationRequests())
+}
+
+func (self *UtilsBot) needJoke(message string) bool {
+	return containsAnySubstr(message, getJokeRequests())
 }
 
 func (self *UtilsBot) processUpdate(update tgbotapi.Update) error {
 	if update.Message == nil {
 		return nil
 	}
-	if !self.chatIsKnown(update.Message.Chat.ID) {
+	var chat = Chat{update.Message.Chat.ID, 0}
+	internalChatId, err := self.db.GetInternalChatId(update.Message.Chat.ID)
+	if err != nil {
 		return errors.New(fmt.Sprintf("Message in unknown chat with ID %d", update.Message.Chat.ID))
 	}
+	chat.internalID = internalChatId
 
 	if self.needNotifications(update.Message.Text) {
-		err := self.notifyAllMembers(update.Message.Chat.ID)
-		if err != nil {
+		if err := self.notifyAllMembers(chat); err != nil {
 			return err
 		}
+	}
+
+	if self.needJoke(update.Message.Text) {
+		self.postJoke(chat)
 	}
 
 	return nil
@@ -149,7 +185,24 @@ func main() {
 	debugFlag := flag.Bool("d", false, "Disables actual notifications with @")
 	flag.Parse()
 
+	logFile, err := os.OpenFile(logFilename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal("Couldn't open log file")
+	}
+
+	defer logFile.Close()
+
+	if !*debugFlag {
+		log.SetOutput(logFile)
+	}
+
+	log.Println("Starting all_bot")
+
 	token := os.Getenv("BOT_TOKEN")
+	if token == "" {
+		log.Fatal("Empty token")
+	}
+
 	botApi, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Panic(err)
